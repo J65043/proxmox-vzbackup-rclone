@@ -4,7 +4,8 @@
 ############ /START CONFIG
 dumpdir="/mnt/pve/pvebackups01/dump" # Set this to where your vzdump files are stored
 MAX_AGE=3 # This is the age in days to keep local backup copies. Local backups older than this are deleted.
-MAX_CLOUD_BACKUPS=5 # Set the maximum number of backups to retain on the cloud per VM.
+MAX_CLOUD_BACKUPS=5 # Set the maximum number of backups to retain on the cloud per VM or container.
+UPLOAD_IDS="101 102" # List of IDs to upload (space-separated). Change this to specify the IDs you want to upload.
 ############ /END CONFIG
 
 _bdir="$dumpdir"
@@ -12,9 +13,9 @@ rcloneroot="$dumpdir/rclone"
 timepath="$(date +%Y)/$(date +%m)/$(date +%d)"
 rclonedir="$rcloneroot/$timepath"
 COMMAND=${1}
-rehydrate=${2} #enter the date you want to rehydrate in the following format: YYYY/MM/DD
-if [ ! -z "${3}" ];then
-        CMDARCHIVE=$(echo "/${3}" | sed -e 's/\(.bin\)*$//g')
+rehydrate=${2} # enter the date you want to rehydrate in the following format: YYYY/MM/DD
+if [ ! -z "${3}" ]; then
+    CMDARCHIVE=$(echo "/${3}" | sed -e 's/\(.bin\)*$//g')
 fi
 tarfile=${TARFILE}
 exten=${tarfile#*.}
@@ -42,31 +43,43 @@ if [[ ${COMMAND} == 'backup-end' ]]; then
     # List all VM backup files on the cloud storage
     backup_list=$(rclone --config /root/.config/rclone/rclone.conf lsf gd-backup_crypt:/ --format "p" --files-only --sort-by modtime)
 
-    # Group backups by VM (assuming VM name or ID is part of the filename)
-    for vm in $(echo "$backup_list" | awk -F'_' '{print $1}' | sort | uniq); do
-        echo "Processing backups for VM: $vm"
+    # Group backups by VM or container ID
+    for id in $(echo "$backup_list" | awk -F'-' '{print $3}' | cut -d'_' -f1 | sort | uniq); do
+        echo "Processing backups for ID: $id"
         
-        # Get a list of backups for the current VM, sorted by time (most recent last)
-        vm_backups=$(echo "$backup_list" | grep "^$vm" | sort)
+        # Check if ID is in the list of IDs to upload
+        if echo "$UPLOAD_IDS" | grep -wq "$id"; then
+            echo "ID $id is in the list of IDs to upload."
 
-        # Count the number of backups for the VM
-        num_backups=$(echo "$vm_backups" | wc -l)
+            # Get a list of backups for the current ID, sorted by time (most recent last)
+            id_backups=$(echo "$backup_list" | grep "-$id-" | sort)
 
-        # If more backups than allowed, delete the oldest ones
-        if [[ $num_backups -gt $MAX_CLOUD_BACKUPS ]]; then
-            delete_count=$((num_backups - MAX_CLOUD_BACKUPS))
-            echo "Deleting $delete_count old backups for VM $vm"
-            old_backups=$(echo "$vm_backups" | head -n $delete_count)
-            for backup in $old_backups; do
-                rclone --config /root/.config/rclone/rclone.conf delete gd-backup_crypt:/$backup -v
-            done
+            # Count the number of backups for the ID
+            num_backups=$(echo "$id_backups" | wc -l)
+
+            # If more backups than allowed, delete the oldest ones
+            if [[ $num_backups -gt $MAX_CLOUD_BACKUPS ]]; then
+                delete_count=$((num_backups - MAX_CLOUD_BACKUPS))
+                echo "Deleting $delete_count old backups for ID $id"
+                old_backups=$(echo "$id_backups" | head -n $delete_count)
+                for backup in $old_backups; do
+                    rclone --config /root/.config/rclone/rclone.conf delete gd-backup_crypt:/$backup -v
+                done
+            else
+                echo "No old backups to delete for ID $id. Cloud storage is within the limit."
+            fi
+
+            # Upload the most recent backup file for the ID
+            recent_backup=$(echo "$id_backups" | tail -n 1)
+            echo "Uploading $recent_backup"
+            rclone --config /root/.config/rclone/rclone.conf move gd-backup_crypt:/$recent_backup gd-backup_crypt:/$timepath -v
         else
-            echo "No old backups to delete for VM $vm. Cloud storage is within the limit."
+            echo "ID $id is not in the list of IDs to upload."
         fi
     done
 fi
 
-if [[ ${COMMAND} == 'job-end' ||  ${COMMAND} == 'job-abort' ]]; then
+if [[ ${COMMAND} == 'job-end' || ${COMMAND} == 'job-abort' ]]; then
     echo "Backing up main PVE configs"
     _tdir=${TMP_DIR:-/var/tmp}
     _tdir=$(mktemp -d $_tdir/proxmox-XXXXXXXX)
